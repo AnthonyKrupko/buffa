@@ -22,10 +22,12 @@
 //! # Ok::<(), buffa::DecodeError>(())
 //! ```
 
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt;
+use core::marker::PhantomData;
 
-use crate::encoding::decode_varint_packed;
+use crate::encoding::{decode_varint_packed, encode_varint};
 use crate::error::DecodeError;
 
 mod sealed {
@@ -126,17 +128,22 @@ fn check_varints(payload: &[u8]) -> Result<usize, DecodeError> {
 
 /// A packed varint field: its packed payload, checked and borrowed, whose elements
 /// [`iter`](Self::iter) decodes. A field that arrives in more than one record (split,
-/// or unpacked, which decoders must accept) holds decoded elements instead.
-#[derive(Clone)]
+/// or unpacked, which decoders must accept) owns its joined payload instead, so
+/// iterating always decodes packed bytes.
 pub struct PackedView<'a, C: PackedCodec> {
-    repr: Repr<'a, C>,
+    bytes: Cow<'a, [u8]>,
+    len: usize,
+    codec: PhantomData<C>,
 }
 
-#[derive(Clone)]
-enum Repr<'a, C: PackedCodec> {
-    /// A checked payload and its number of elements.
-    Borrowed(&'a [u8], usize),
-    Decoded(Vec<C::Elem>),
+impl<C: PackedCodec> Clone for PackedView<'_, C> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            len: self.len,
+            codec: PhantomData,
+        }
+    }
 }
 
 impl<'a, C: PackedCodec> PackedView<'a, C> {
@@ -155,25 +162,19 @@ impl<'a, C: PackedCodec> PackedView<'a, C> {
     /// The number of elements.
     #[must_use]
     pub fn len(&self) -> usize {
-        match &self.repr {
-            Repr::Borrowed(_, len) => *len,
-            Repr::Decoded(v) => v.len(),
-        }
+        self.len
     }
 
     /// Whether the field has no elements.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
 
     /// The elements, decoded as they are iterated.
     #[must_use]
     pub fn iter(&self) -> PackedIter<'_, C> {
-        match &self.repr {
-            Repr::Borrowed(bytes, len) => PackedIter(Iter::Borrowed(bytes, *len)),
-            Repr::Decoded(v) => PackedIter(Iter::Decoded(v.iter())),
-        }
+        PackedIter(&self.bytes, self.len, PhantomData)
     }
 
     /// The elements, decoded into a `Vec`.
@@ -183,7 +184,7 @@ impl<'a, C: PackedCodec> PackedView<'a, C> {
     }
 
     /// Appends a packed record of the field. The first one is borrowed; a later one
-    /// moves the field to decoded elements.
+    /// is joined to it in an owned payload.
     ///
     /// # Errors
     ///
@@ -194,34 +195,27 @@ impl<'a, C: PackedCodec> PackedView<'a, C> {
             return Ok(());
         }
         if self.is_empty() {
-            self.repr = Repr::Borrowed(payload, len);
+            self.bytes = Cow::Borrowed(payload);
         } else {
-            self.decoded()
-                .extend(PackedIter::<C>(Iter::Borrowed(payload, len)));
+            self.bytes.to_mut().extend_from_slice(payload);
         }
+        self.len += len;
         Ok(())
     }
 
     /// Appends an element of the field that arrived unpacked.
     pub fn push(&mut self, elem: C::Elem) {
-        self.decoded().push(elem);
-    }
-
-    fn decoded(&mut self) -> &mut Vec<C::Elem> {
-        if let Repr::Borrowed(..) = self.repr {
-            self.repr = Repr::Decoded(self.to_vec());
-        }
-        match &mut self.repr {
-            Repr::Decoded(v) => v,
-            Repr::Borrowed(..) => unreachable!("replaced above"),
-        }
+        encode_varint(C::to_varint(elem), self.bytes.to_mut());
+        self.len += 1;
     }
 }
 
 impl<C: PackedCodec> Default for PackedView<'_, C> {
     fn default() -> Self {
         Self {
-            repr: Repr::Borrowed(&[], 0),
+            bytes: Cow::Borrowed(&[]),
+            len: 0,
+            codec: PhantomData,
         }
     }
 }
@@ -266,15 +260,20 @@ fn next_short(bytes: &mut &[u8]) -> u64 {
     value
 }
 
-/// The elements of a [`PackedView`], decoded as they are iterated.
-#[derive(Clone, Debug)]
-pub struct PackedIter<'s, C: PackedCodec>(Iter<'s, C>);
+/// The elements of a [`PackedView`], decoded as they are iterated: the rest of a
+/// checked payload, and its number of elements.
+pub struct PackedIter<'s, C: PackedCodec>(&'s [u8], usize, PhantomData<C>);
 
-#[derive(Clone, Debug)]
-enum Iter<'s, C: PackedCodec> {
-    /// The rest of a checked payload, and its number of elements.
-    Borrowed(&'s [u8], usize),
-    Decoded(core::slice::Iter<'s, C::Elem>),
+impl<C: PackedCodec> Clone for PackedIter<'_, C> {
+    fn clone(&self) -> Self {
+        Self(self.0, self.1, PhantomData)
+    }
+}
+
+impl<C: PackedCodec> fmt::Debug for PackedIter<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
 }
 
 impl<C: PackedCodec> Iterator for PackedIter<'_, C> {
@@ -282,31 +281,24 @@ impl<C: PackedCodec> Iterator for PackedIter<'_, C> {
 
     #[inline]
     fn next(&mut self) -> Option<C::Elem> {
-        match &mut self.0 {
-            Iter::Borrowed(_, 0) => None,
-            Iter::Borrowed(bytes, remaining) => {
-                *remaining -= 1;
-                if C::SHORT {
-                    return Some(C::from_varint(next_short(bytes)));
-                }
-                let v = decode_varint_packed(bytes);
-                debug_assert!(
-                    v.is_ok(),
-                    "a checked payload holds only well-formed varints"
-                );
-                Some(C::from_varint(v.unwrap_or(0)))
-            }
-            Iter::Decoded(elems) => elems.next().copied(),
+        if self.1 == 0 {
+            return None;
         }
+        self.1 -= 1;
+        if C::SHORT {
+            return Some(C::from_varint(next_short(&mut self.0)));
+        }
+        let v = decode_varint_packed(&mut self.0);
+        debug_assert!(
+            v.is_ok(),
+            "a checked payload holds only well-formed varints"
+        );
+        Some(C::from_varint(v.unwrap_or(0)))
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = match &self.0 {
-            Iter::Borrowed(_, remaining) => *remaining,
-            Iter::Decoded(elems) => elems.len(),
-        };
-        (len, Some(len))
+        (self.1, Some(self.1))
     }
 }
 
@@ -388,6 +380,21 @@ mod tests {
         let bytes = varints(&negatives.map(Int32::to_varint));
         let view = PackedView::<Int32>::from_packed(&bytes).unwrap();
         assert_eq!(view.to_vec(), negatives);
+    }
+
+    #[test]
+    fn joined_records_iterate_like_one() {
+        let (first, second) = (varints(&[1, 300]), varints(&[1 << 40, 5]));
+        let mut view = PackedView::<Uint64>::from_packed(&first).unwrap();
+        view.extend_packed(&second).unwrap();
+        view.push(u64::MAX);
+        let whole = [&first[..], &second, &varints(&[u64::MAX])].concat();
+        let one = PackedView::<Uint64>::from_packed(&whole).unwrap();
+        assert_eq!(view.len(), 5);
+        assert_eq!(view.to_vec(), one.to_vec());
+        assert_eq!(view.iter().len(), 5);
+        let collected: Vec<u64> = view.clone().iter().skip(2).collect();
+        assert_eq!(collected, [1 << 40, 5, u64::MAX]);
     }
 
     #[test]
