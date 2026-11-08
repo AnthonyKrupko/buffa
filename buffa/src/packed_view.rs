@@ -46,10 +46,18 @@ pub trait PackedCodec: sealed::Sealed {
     /// The varint an element encodes to.
     #[doc(hidden)]
     fn to_varint(e: Self::Elem) -> u64;
+
+    /// Whether the canonical varints are at most five bytes long, so iterating
+    /// decodes them a byte at a time rather than with the unrolled decoder, which
+    /// is faster only for long ones.
+    #[doc(hidden)]
+    const SHORT: bool;
 }
 
 macro_rules! codecs {
-    ($($(#[$doc:meta])* $name:ident: $elem:ty, |$v:ident| $from:expr, |$e:ident| $to:expr;)*) => {$(
+    (@short short) => { true };
+    (@short) => { false };
+    ($($(#[$doc:meta])* $name:ident: $elem:ty, $($short:ident,)? |$v:ident| $from:expr, |$e:ident| $to:expr;)*) => {$(
         $(#[$doc])*
         #[derive(Debug, Clone, Copy)]
         pub enum $name {}
@@ -58,6 +66,8 @@ macro_rules! codecs {
 
         impl PackedCodec for $name {
             type Elem = $elem;
+
+            const SHORT: bool = codecs!(@short $($short)?);
 
             #[inline]
             fn from_varint($v: u64) -> $elem {
@@ -78,15 +88,15 @@ codecs! {
     /// `int64`.
     Int64: i64, |v| v as i64, |e| e as u64;
     /// `uint32`.
-    Uint32: u32, |v| v as u32, |e| u64::from(e);
+    Uint32: u32, short, |v| v as u32, |e| u64::from(e);
     /// `uint64`.
     Uint64: u64, |v| v, |e| e;
     /// `sint32`.
-    Sint32: i32, |v| crate::types::zigzag_decode_i32(v as u32), |e| u64::from(crate::types::zigzag_encode_i32(e));
+    Sint32: i32, short, |v| crate::types::zigzag_decode_i32(v as u32), |e| u64::from(crate::types::zigzag_encode_i32(e));
     /// `sint64`.
     Sint64: i64, |v| crate::types::zigzag_decode_i64(v), |e| crate::types::zigzag_encode_i64(e);
     /// `bool`.
-    Bool: bool, |v| v != 0, |e| u64::from(e);
+    Bool: bool, short, |v| v != 0, |e| u64::from(e);
 }
 
 /// Checks a packed varint payload and counts its elements, with the errors that
@@ -231,6 +241,31 @@ impl<C: PackedCodec> fmt::Debug for PackedView<'_, C> {
     }
 }
 
+/// Decodes the next varint of a checked payload a byte at a time. For short
+/// varints this is faster than the unrolled decoder, and small enough to inline
+/// into the loops that iterate the field.
+#[inline]
+fn next_short(bytes: &mut &[u8]) -> u64 {
+    let Some((&first, mut rest)) = bytes.split_first() else {
+        return 0;
+    };
+    if first < 0x80 {
+        *bytes = rest;
+        return u64::from(first);
+    }
+    let (mut value, mut shift) = (u64::from(first & 0x7f), 7);
+    while let Some((&b, tail)) = rest.split_first() {
+        rest = tail;
+        value |= u64::from(b & 0x7f) << shift;
+        if b < 0x80 {
+            break;
+        }
+        shift += 7;
+    }
+    *bytes = rest;
+    value
+}
+
 /// The elements of a [`PackedView`], decoded as they are iterated.
 #[derive(Clone, Debug)]
 pub struct PackedIter<'s, C: PackedCodec>(Iter<'s, C>);
@@ -251,6 +286,9 @@ impl<C: PackedCodec> Iterator for PackedIter<'_, C> {
             Iter::Borrowed(_, 0) => None,
             Iter::Borrowed(bytes, remaining) => {
                 *remaining -= 1;
+                if C::SHORT {
+                    return Some(C::from_varint(next_short(bytes)));
+                }
                 let v = decode_varint_packed(bytes);
                 debug_assert!(
                     v.is_ok(),
@@ -331,6 +369,25 @@ mod tests {
         iter.next();
         assert_eq!(iter.len(), 2);
         assert_eq!((&view).into_iter().sum::<u32>(), 301);
+    }
+
+    #[test]
+    fn iterates_varints_of_every_length() {
+        // The largest and smallest values of each length, from 1 to 10 bytes.
+        let mut values = vec![0, u64::MAX];
+        values.extend((7..64).step_by(7).flat_map(|s| [(1 << s) - 1, 1 << s]));
+        let bytes = varints(&values);
+        let view = PackedView::<Uint64>::from_packed(&bytes).unwrap();
+        assert_eq!(view.to_vec(), values);
+        // uint32 takes the short path, which keeps the low 32 bits of longer varints.
+        let view = PackedView::<Uint32>::from_packed(&bytes).unwrap();
+        let low: Vec<u32> = values.iter().map(|&v| v as u32).collect();
+        assert_eq!(view.to_vec(), low);
+        // Negative int32 values are sign-extended to 10-byte varints.
+        let negatives = [-1, i32::MIN, -300];
+        let bytes = varints(&negatives.map(Int32::to_varint));
+        let view = PackedView::<Int32>::from_packed(&bytes).unwrap();
+        assert_eq!(view.to_vec(), negatives);
     }
 
     #[test]
