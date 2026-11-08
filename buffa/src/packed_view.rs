@@ -330,7 +330,7 @@ mod tests {
                 Some(0x80),
             ] {
                 let mut payload = vec![0x05];
-                payload.extend(core::iter::repeat_n(0xff, run));
+                payload.extend(core::iter::repeat(0xff).take(run));
                 payload.extend(last);
                 let mut cur = &payload[..];
                 let mut expected = Ok(0);
